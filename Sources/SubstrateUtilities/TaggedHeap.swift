@@ -40,6 +40,8 @@ public enum TaggedHeap {
     #endif
     
     public static func initialise(capacity: Int = TaggedHeap.defaultHeapCapacity) {
+        Threading.initialise()
+        
         self.blockCount = (capacity + TaggedHeap.blockSize - 1) / TaggedHeap.blockSize
         self.bitSetStorageCount = (self.blockCount + BitSet.bitsPerElement) / BitSet.bitsPerElement
         
@@ -270,7 +272,7 @@ public struct TagAllocator {
     }
     
     @inlinable
-    public init(tag: TaggedHeap.Tag, threadCount: Int) {
+    public init(tag: TaggedHeap.Tag, threadCount: Int = Threading.threadCount) {
         let firstBlock = TaggedHeap.allocateBlocks(tag: tag, count: 1)
         self.memory = firstBlock
         
@@ -338,8 +340,6 @@ public struct TagAllocator {
     
     /// Calls a statically-set function to determine the current thread.
     public struct DynamicThreadView {
-        public static var threadIndexRetrievalFunc : (() -> Int) = { return 0 }
-        
         @usableFromInline var allocator : TagAllocator
         
         @inlinable
@@ -352,7 +352,7 @@ public struct TagAllocator {
             if useSystemAllocator {
                 return .allocate(byteCount: bytes, alignment: alignment)
             }
-            return self.allocator.allocate(bytes: bytes, alignment: alignment, threadIndex: DynamicThreadView.threadIndexRetrievalFunc())
+            return self.allocator.allocate(bytes: bytes, alignment: alignment, threadIndex: Threading.threadIndex)
         }
         
         @inlinable
@@ -360,7 +360,7 @@ public struct TagAllocator {
             if useSystemAllocator {
                 return .allocate(capacity: capacity)
             }
-            return self.allocator.allocate(capacity: capacity, threadIndex: DynamicThreadView.threadIndexRetrievalFunc())
+            return self.allocator.allocate(capacity: capacity, threadIndex: Threading.threadIndex)
         }
 
         @inlinable
@@ -402,7 +402,6 @@ public struct TagAllocator {
                 return .allocate(byteCount: bytes, alignment: alignment)
             }
             
-            assert(DynamicThreadView.threadIndexRetrievalFunc() == threadIndex)
             return self.allocator.allocate(bytes: bytes, alignment: alignment, threadIndex: self.threadIndex)
         }
         
@@ -411,7 +410,6 @@ public struct TagAllocator {
             if useSystemAllocator {
                 return .allocate(capacity: capacity)
             }
-            assert(DynamicThreadView.threadIndexRetrievalFunc() == threadIndex)
             return self.allocator.allocate(capacity: capacity, threadIndex: self.threadIndex)
         }
 
@@ -430,6 +428,11 @@ public struct TagAllocator {
             }
             // No-op.
         }
+    }
+    
+    @inlinable
+    public var threadView : ThreadView {
+        return ThreadView(allocator: self, threadIndex: Threading.threadIndex)
     }
 }
 
