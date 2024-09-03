@@ -745,7 +745,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     }
     
     @discardableResult
-    public func allocateTexture(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async -> MTLTextureReference {
+    public func allocateTexture(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async throws -> MTLTextureReference {
         let properties = self.computeTextureUsage(texture, isStoredThisFrame: isStoredThisFrame)
         
         if texture.flags.contains(.windowHandle) {
@@ -759,6 +759,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
                 }
                 catch {
                     print("Error allocating window handle texture: \(error)")
+                    throw error
                 }
             }
             return texture.backingResourcePointer.map { MTLTextureReference(texture: .fromOpaque($0)) } ?? MTLTextureReference(windowTexture: ())
@@ -919,11 +920,11 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     
     
     @discardableResult
-    public func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async -> MTLTextureReference {
+    public func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async throws -> MTLTextureReference {
         if let mtlTexture = texture.backingResourcePointer {
             return MTLTextureReference(texture: .fromOpaque(mtlTexture))
         }
-        return await self.allocateTexture(texture, forceGPUPrivate: forceGPUPrivate, isStoredThisFrame: isStoredThisFrame)
+        return try await self.allocateTexture(texture, forceGPUPrivate: forceGPUPrivate, isStoredThisFrame: isStoredThisFrame)
     }
     
     func allocateArgumentBufferStorage<A : ResourceProtocol>(for argumentBuffer: A, encodedLength: Int) -> (MTLBufferReference, [FenceDependency], ContextWaitEvent) {

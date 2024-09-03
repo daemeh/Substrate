@@ -105,7 +105,7 @@ protocol BackendTransientResourceRegistry: Sendable {
     func registerWindowTexture(for texture: Texture, swapchain: Swapchain) async
     
     func allocateBufferIfNeeded(_ buffer: Buffer, forceGPUPrivate: Bool) -> Backend.BufferReference
-    func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async -> Backend.TextureReference
+    func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async throws -> Backend.TextureReference
     func allocateWindowHandleTexture(_ texture: Texture) async throws -> Backend.TextureReference
     func allocateTextureView(_ texture: Texture) -> Backend.TextureReference
 #if canImport(Metal)

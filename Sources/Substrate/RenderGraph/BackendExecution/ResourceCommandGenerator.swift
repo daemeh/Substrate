@@ -60,7 +60,7 @@ enum PreFrameCommands {
     }
     
     @_specialize(kind: full, where Backend == MetalBackend)
-    func execute<Backend: SpecificRenderBackend>(commandIndex: Int, context: RenderGraphContextImpl<Backend>, textureIsStored: (Texture) -> Bool, encoderDependencies: inout DependencyTable<Backend.InterEncoderDependencyType?>, waitEventValues: inout QueueCommandIndices, signalEventValue: UInt64) async {
+    func execute<Backend: SpecificRenderBackend>(commandIndex: Int, context: RenderGraphContextImpl<Backend>, textureIsStored: (Texture) -> Bool, encoderDependencies: inout DependencyTable<Backend.InterEncoderDependencyType?>, waitEventValues: inout QueueCommandIndices, signalEventValue: UInt64) async throws {
         let queue = context.renderGraphQueue
         let queueIndex = Int(queue.index)
         let resourceRegistry = context.resourceRegistry // May be nil iff the render graph does not support transient resources.
@@ -77,7 +77,12 @@ enum PreFrameCommands {
             
         case .materialiseTexture(let texture):
             // If the resource hasn't already been allocated and is transient, we should force it to be GPU private since the CPU is guaranteed not to use it.
-            _ = await resourceRegistry!.allocateTextureIfNeeded(texture, forceGPUPrivate: !texture._usesPersistentRegistry, isStoredThisFrame: textureIsStored(texture))
+            do {
+                _ = try await resourceRegistry!.allocateTextureIfNeeded(texture, forceGPUPrivate: !texture._usesPersistentRegistry, isStoredThisFrame: textureIsStored(texture))
+            } catch {
+                print("Error allocating texture: \(error)")
+                throw error
+            }
             if let textureWaitEvent = (texture.flags.contains(.historyBuffer) ? resourceRegistry!.historyBufferResourceWaitEvents[Resource(texture)] : resourceRegistry!.textureWaitEvents[texture]) {
                 waitEventValues[queueIndex] = max(textureWaitEvent.waitValue, waitEventValues[queueIndex])
             } else {
@@ -572,7 +577,7 @@ final class ResourceCommandGenerator<Backend: SpecificRenderBackend> {
         }
     }
     
-    func executePreFrameCommands(context: RenderGraphContextImpl<Backend>, frameCommandInfo: inout FrameCommandInfo<Backend.RenderTargetDescriptor>) async {
+    func executePreFrameCommands(context: RenderGraphContextImpl<Backend>, frameCommandInfo: inout FrameCommandInfo<Backend.RenderTargetDescriptor>, onPresented: RenderGraph.SwapchainPresentedCallback? = nil) async {
         let signpostState = RenderGraph.signposter.beginInterval("Execute Pre-Frame Resource Commands")
         defer { RenderGraph.signposter.endInterval("Execute Pre-Frame Resource Commands", signpostState) }
         
@@ -587,12 +592,19 @@ final class ResourceCommandGenerator<Backend: SpecificRenderBackend> {
                 queueCommandWaitIndices = QueueCommandIndices()
             }
             let commandBufferIndex = frameCommandInfo.commandEncoders[commandEncoderIndex].commandBufferIndex
-            await command.command.execute(commandIndex: command.index,
-                                    context: context,
-                                    textureIsStored: { frameCommandInfo.storedTextures.contains($0) },
-                                    encoderDependencies: &self.commandEncoderDependencies,
-                                    waitEventValues: &queueCommandWaitIndices,
-                                    signalEventValue: frameCommandInfo.globalCommandBufferIndex(frameIndex: commandBufferIndex))
+            do {
+                try await command.command.execute(commandIndex: command.index,
+                                                  context: context,
+                                                  textureIsStored: { frameCommandInfo.storedTextures.contains($0) },
+                                                  encoderDependencies: &self.commandEncoderDependencies,
+                                                  waitEventValues: &queueCommandWaitIndices,
+                                                  signalEventValue: frameCommandInfo.globalCommandBufferIndex(frameIndex: commandBufferIndex))
+            } catch {
+                print("Error executing pre-frame command: \(error)")
+                if let onPresented = onPresented {
+                    onPresented(nil, .failure(error))
+                }
+            }
         }
         
         frameCommandInfo.commandEncoders[commandEncoderIndex].queueCommandWaitIndices = queueCommandWaitIndices
