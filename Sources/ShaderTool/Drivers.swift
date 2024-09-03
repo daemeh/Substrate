@@ -231,9 +231,9 @@ final class MetalDriver {
         self.target = target
     }
     
-    private var targetString: String {
+    private var targetString: String? {
         guard case .metal(let platform, let deploymentTarget) = self.target else {
-            preconditionFailure()
+            return nil
         }
         
         switch platform {
@@ -259,8 +259,10 @@ final class MetalDriver {
                          "metal", "-c", "-ffast-math",
                          "-Wno-unused-const-variable", // Ignore warnings for unused function constants
                          "-Wno-unused-variable", // Ignore warnings for unused variables
-                         "-target", self.targetString,
             ]
+        if let targetString = self.targetString {
+            arguments.append(contentsOf: ["-target", targetString])
+        }
         if debug {
             arguments.append(contentsOf: ["-gline-tables-only", "-frecord-sources"])
         }
@@ -285,7 +287,10 @@ final class MetalDriver {
     func generateLibrary(airFiles: [URL], outputLibrary: URL, withDebugInformation debug: Bool) throws -> Process {
         var arguments = ["-sdk", target.metalSDK!, "metal",
                          "-o", outputLibrary.path,
-                         "-target", self.targetString]
+                         ]
+        if let targetString = self.targetString {
+            arguments.append(contentsOf: ["-target", targetString])
+        }
         if debug {
             arguments.append(contentsOf: ["-gline-tables-only", "-frecord-sources"])
         }
