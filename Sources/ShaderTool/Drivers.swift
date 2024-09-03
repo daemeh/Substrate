@@ -231,9 +231,9 @@ final class MetalDriver {
         self.target = target
     }
     
-    private var targetString: String {
+    private var targetString: String? {
         guard case .metal(let platform, let deploymentTarget) = self.target else {
-            preconditionFailure()
+            return nil
         }
         
         switch platform {
@@ -258,9 +258,11 @@ final class MetalDriver {
         var arguments = ["-sdk", target.metalSDK!,
                          "metal", "-c", "-ffast-math",
                          "-Wno-unused-const-variable", // Ignore warnings for unused function constants
-                         "-Wno-unused-variable", // Ignore warnings for unused variables
-                         "-target", self.targetString,
+                         "-Wno-unused-variable", // Ignore warnings for unused variables                         
             ]
+        if let targetString = self.targetString {
+            arguments.append(contentsOf: ["-target", targetString])
+        }
         if debug {
             arguments.append(contentsOf: ["-gline-tables-only", "-frecord-sources"])
         }
@@ -284,8 +286,10 @@ final class MetalDriver {
     
     func generateLibrary(airFiles: [URL], outputLibrary: URL) throws -> Process {
         var arguments = ["-sdk", target.metalSDK!, "metal",
-                         "-o", outputLibrary.path,
-                         "-target", self.targetString]
+                         "-o", outputLibrary.path]
+        if let targetString = self.targetString {
+            arguments.append(contentsOf: ["-target", targetString])
+        }
         arguments.append(contentsOf: airFiles.lazy.map { $0.path })
         return try Process.run(self.url, arguments: arguments, terminationHandler: nil)
     }
