@@ -1536,19 +1536,17 @@ public final class RenderGraph: @unchecked Sendable {
         
         return await Self.executionStream.enqueueAndWait { [renderPasses, completionNotifyQueue, onSwapchainPresented] () -> RenderGraphExecutionWaitToken in // NOTE: if we decide not to have a global lock on RenderGraph execution, we need to handle resource usages on a per-render-graph basis.
             let signpostState = Self.signposter.beginInterval("Execute RenderGraph on Context", id: self.signpostID)
-            let waitToken = await Self.$activeRenderGraph.withValue(self) {
-                return await self.context.executeRenderGraph(self, renderPasses: renderPasses, waitingFor: gpuQueueWaitIndices, onSwapchainPresented: onSwapchainPresented, onCompletion: { queueCommandRange in
-                    self.didCompleteRender(queueCommandRange: queueCommandRange)
-                    
-                    if !completionNotifyQueue.isEmpty {
-                        Task.detached { [completionNotifyQueue] in
-                            for item in completionNotifyQueue {
-                                await item()
-                            }
+            let waitToken = await self.context.executeRenderGraph(self, renderPasses: renderPasses, waitingFor: gpuQueueWaitIndices, onSwapchainPresented: onSwapchainPresented, onCompletion: { queueCommandRange in
+                self.didCompleteRender(queueCommandRange: queueCommandRange)
+                
+                if !completionNotifyQueue.isEmpty {
+                    Task.detached { [completionNotifyQueue] in
+                        for item in completionNotifyQueue {
+                            await item()
                         }
                     }
-                })
-            }
+                }
+            })
             
             Self.signposter.endInterval("Execute RenderGraph on Context", signpostState)
             
