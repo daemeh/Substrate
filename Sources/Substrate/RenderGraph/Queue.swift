@@ -90,8 +90,16 @@ public final class QueueRegistry: @unchecked Sendable {
                 if self.allocatedQueues & (1 << i) == 0 {
                     self.allocatedQueues |= (1 << i)
                     
-                    UInt64.AtomicRepresentation.atomicStore(0, at: self.lastSubmittedCommands.advanced(by: i), ordering: .relaxed)
-                    UInt64.AtomicRepresentation.atomicStore(0, at: self.lastCompletedCommands.advanced(by: i), ordering: .relaxed)
+                    // Deliberately do NOT reset lastSubmittedCommands/lastCompletedCommands here.
+                    // Queue indices are recycled, but per-resource wait indices (and argument
+                    // buffers' contentAccessWaitIndices) written by a previous owner of this
+                    // index are never cleared. If the numbering restarted at zero, those stale
+                    // marks would read as *future* command indices for the new owner, and its
+                    // first command buffer would encode a GPU wait on its own upcoming signal —
+                    // an unsatisfiable self-wait (GPU timeout, then the OS ignores all further
+                    // submissions from the process). Keeping the per-index numbering monotonic
+                    // makes every stale mark compare as already-completed work, so the existing
+                    // `> lastCompletedCommand` checks filter it out.
                     
                     return UInt8(i)
                 }

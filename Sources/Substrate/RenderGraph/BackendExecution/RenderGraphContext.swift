@@ -53,6 +53,11 @@ actor RenderGraphContextImpl<Backend: SpecificRenderBackend>: _RenderGraphContex
         self.commandGenerator = ResourceCommandGenerator()
         self.syncEvent = backend.makeSyncEvent(for: self.renderGraphQueue)
         
+        // Queue indices are recycled with monotonic command numbering (see
+        // QueueRegistry.allocate), so continue from wherever the previous owner of
+        // this index left off rather than restarting at zero.
+        self.queueCommandBufferIndex = self.renderGraphQueue.lastSubmittedCommand
+        
         self.taskStream = TaskStream()
     }
                                              

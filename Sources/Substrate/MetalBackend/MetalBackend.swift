@@ -524,6 +524,14 @@ public final class MetalBackend : SpecificRenderBackend, @unchecked Sendable {
     }
 
     func makeSyncEvent(for queue: Queue) -> MTLEvent {
+        // Reuse the event if this queue index has had one before. Queue indices are
+        // recycled with monotonic command numbering (see QueueRegistry.allocate), so the
+        // event's signaled value must carry over too: stale waits against a previous
+        // owner of this index must resolve as already-signaled rather than waiting for
+        // the new owner to reach that value on a fresh event.
+        if let existingEvent = self.queueSyncEvents[Int(queue.index)] {
+            return existingEvent
+        }
         let event = self.device.makeEvent()!
         self.queueSyncEvents[Int(queue.index)] = event
         return event
@@ -535,8 +543,13 @@ public final class MetalBackend : SpecificRenderBackend, @unchecked Sendable {
     
 
     func freeSyncEvent(for queue: Queue) {
+        // Deliberately keep the event alive (and registered) after its render graph is
+        // torn down. Command buffers are created with unretained references, so an
+        // in-flight buffer on another queue that encoded a wait on this event would
+        // otherwise reference a deallocated object and fail with
+        // kIOGPUCommandBufferCallbackErrorInvalidInput. At most QueueRegistry.maxQueues
+        // events are kept for the lifetime of the backend.
         assert(self.queueSyncEvents[Int(queue.index)] != nil)
-        self.queueSyncEvents[Int(queue.index)] = nil
     }
 
     func makeTransientRegistry(index: Int, inflightFrameCount: Int, queue: Queue) -> MetalTransientResourceRegistry {

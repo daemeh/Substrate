@@ -69,7 +69,17 @@ public final class VulkanBackend : SpecificRenderBackend {
         
         RenderBackend._backend = self
     }
-    
+
+    deinit {
+        // The backend holds a strong reference to the device, so this runs before
+        // the device's own deinit destroys the VkDevice.
+        for semaphore in self.queueSyncSemaphores {
+            if let semaphore = semaphore {
+                vkDestroySemaphore(self.device.vkDevice, semaphore, nil)
+            }
+        }
+    }
+
     func reloadShaderLibraryIfNeeded() async {
         if self.enableShaderHotReloading {
             await self.stateCaches.checkForLibraryReload()
@@ -261,6 +271,14 @@ public final class VulkanBackend : SpecificRenderBackend {
     }
     
     func makeSyncEvent(for queue: Queue) -> Event {
+        // Reuse the semaphore if this queue index has had one before. Queue indices are
+        // recycled with monotonic command numbering (see QueueRegistry.allocate), so the
+        // semaphore's timeline value must carry over too: stale waits against a previous
+        // owner of this index must resolve as already-signaled rather than waiting for
+        // the new owner to reach that value on a fresh semaphore.
+        if let existingSemaphore = self.queueSyncSemaphores[Int(queue.index)] {
+            return existingSemaphore
+        }
         var semaphoreTypeCreateInfo = VkSemaphoreTypeCreateInfo()
         semaphoreTypeCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO
         semaphoreTypeCreateInfo.initialValue = 0
@@ -282,9 +300,12 @@ public final class VulkanBackend : SpecificRenderBackend {
     }
     
     func freeSyncEvent(for queue: Queue) {
+        // Deliberately keep the semaphore alive (and registered) after its render graph is
+        // torn down. An in-flight command buffer on another queue that encoded a wait on
+        // this semaphore would otherwise reference a destroyed object. At most
+        // QueueRegistry.maxQueues semaphores are kept for the lifetime of the backend;
+        // they are destroyed in deinit.
         assert(self.queueSyncSemaphores[Int(queue.index)] != nil)
-        vkDestroySemaphore(self.device.vkDevice, self.queueSyncSemaphores[Int(queue.index)], nil)
-        self.queueSyncSemaphores[Int(queue.index)] = nil
     }
     
     func didCompleteCommand(_ index: UInt64, queue: Queue, context: RenderGraphContextImpl<VulkanBackend>) {
