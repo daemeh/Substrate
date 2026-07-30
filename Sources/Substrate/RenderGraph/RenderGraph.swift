@@ -748,6 +748,22 @@ protocol _RenderGraphContext : Actor {
 }
 
 /// Each RenderGraph executes on its own GPU queue, although executions are synchronised by submission order.
+/// Frees a transient registry index when released. Enqueued as a command-end action from
+/// `RenderGraph.deinit` so the free happens only after all GPU work submitted up to that
+/// point has completed - reissuing an index while its previous owner's execution is still
+/// in flight collides resource handles between the two graphs (see the deinit note).
+final class TransientRegistryIndexFreeToken {
+    let index: Int
+
+    init(index: Int) {
+        self.index = index
+    }
+
+    deinit {
+        TransientRegistryManager.free(self.index)
+    }
+}
+
 public final class RenderGraph: @unchecked Sendable {
     @TaskLocal public static var activeRenderGraph : RenderGraph? = nil
     
@@ -819,8 +835,18 @@ public final class RenderGraph: @unchecked Sendable {
     }
     
     deinit {
-        if self.transientRegistryIndex > 0 {
-            TransientRegistryManager.free(self.transientRegistryIndex)
+        // The index free MUST wait for in-flight GPU work (2026-07-30, LiveSurface storm
+        // crashes): freeing here let the index be reissued while this graph's last
+        // submission was still executing, and TransientFixedSizeRegistry.initialise's
+        // silent reuse produced handle collisions between the disposed graph's in-flight
+        // textures and the new graph's first ones - missing-wait-event traps in
+        // PreFrameCommands and over-releases in CommandEndActionManager. Route the free
+        // through the command-end-action machinery so it runs only after everything
+        // currently submitted (on any queue) completes. Also note: this previously
+        // tested `> 0`, so index 0 was never freed at all - which accidentally shielded
+        // the first-created graph from the collision, and leaked the index.
+        if self.transientRegistryIndex >= 0 {
+            CommandEndActionManager.enqueue(action: .release(Unmanaged.passRetained(TransientRegistryIndexFreeToken(index: self.transientRegistryIndex))))
         }
         self.renderPassLock.deinit()
         self.frameTimingLock.deinit()

@@ -331,22 +331,30 @@ final class TransientRegistryManager {
     }
     
     func initialise(capacity: Int) {
-        // Q7 diagnostic (2026-07-29): this assert assumes a transient registry index is
-        // never reissued while its registry still holds state - but RenderGraph.deinit
-        // frees the index with no in-flight synchronisation, and in optimized builds the
-        // assert compiles out and this method silently RE-runs: count resets, storage is
-        // reallocated (old storage leaks; in-flight handles now alias fresh slots), and
-        // `generation` is NOT bumped, so the new graph's first textures collide handle-
-        // for-handle with the disposed graph's in-flight ones. Prime suspect for the
-        // missing-wait-event trap in PreFrameCommands (the disposed graph's execution
-        // writes a backing pointer into the recycled slot; the new graph's materialise
-        // then skips allocation and finds no wait event). Log the reuse so a trap can be
-        // correlated; behaviour is deliberately unchanged until the mechanism is
-        // confirmed from a full log.
+        // Reuse-safety (2026-07-30, LiveSurface storm crashes): a reissued index used to
+        // hit this method with the registry still holding the previous graph's state -
+        // the assert below compiles out in optimized builds, so it silently re-ran:
+        // count reset, storage reallocated (old leaked; in-flight handles aliased fresh
+        // slots), and `generation` NOT bumped, colliding the new graph's first handles
+        // with the disposed graph's in-flight ones (missing-wait-event traps,
+        // over-releases). RenderGraph.deinit now defers the index free until GPU
+        // completion, which prevents mid-flight reuse; this path additionally makes
+        // reuse CORRECT regardless of teardown ordering: clear() deinitialises the old
+        // slots and bumps the generation (no handle can collide), and matching-capacity
+        // storage is reused instead of leaked. The print stays as a canary - with the
+        // deferred free it should be rare and benign.
         if self.capacity != 0 {
-            print("[RenderGraph] transient registry index \(self.transientRegistryIndex) REINITIALISED while holding state (capacity \(self.capacity), generation \(self.generation)) - index recycled with a live registry")
+            print("[RenderGraph] transient registry index \(self.transientRegistryIndex) reinitialised while holding state (generation \(self.generation)) - clearing for reuse")
+            self.clear()
+            if self.capacity == capacity {
+                return
+            }
+            // Different capacity requested: replace the storage allocations.
+            self.sharedPropertyStorage.deallocate()
+            self.sharedStorage.deallocate()
+            self.transientStorage.deallocate()
+            self.labels.deallocate()
         }
-        assert(self.capacity == 0)
 
         self.capacity = capacity
 
