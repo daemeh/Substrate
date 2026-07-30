@@ -77,6 +77,10 @@ enum PreFrameCommands {
             buffer.applyDeferredSliceActions()
             
         case .materialiseTexture(let texture):
+            // Diagnostic capture (2026-07-30): whether the backing pointer was set BEFORE this
+            // materialise decides between the candidate mechanisms below - allocateTextureIfNeeded
+            // early-returns on a pre-set pointer WITHOUT registering a wait event.
+            let hadBackingBeforeMaterialise = texture.backingResourcePointer != nil
             // If the resource hasn't already been allocated and is transient, we should force it to be GPU private since the CPU is guaranteed not to use it.
             do {
                 _ = try await resourceRegistry!.allocateTextureIfNeeded(texture, forceGPUPrivate: !texture._usesPersistentRegistry, isStoredThisFrame: textureIsStored(texture))
@@ -88,15 +92,25 @@ enum PreFrameCommands {
                 waitEventValues[queueIndex] = max(textureWaitEvent.waitValue, waitEventValues[queueIndex])
             } else {
                 if !texture.flags.contains(.windowHandle) {
-                    // A transient texture with no wait event in THIS graph's registry was
-                    // allocated by a different (likely already-disposed) render graph - the
-                    // cross-graph resource-lifetime family. Identify it before the trap so a
-                    // crash in the field still names the culprit in the console log
-                    // (2026-07-29: hit once during live emboss-blur adjustment; the paused
-                    // debugger was lost before the texture could be inspected).
+                    // A transient texture with no wait event in THIS graph's registry. The
+                    // discriminating fields (2026-07-30, deterministic repro on emboss
+                    // adjustment in LiveSurface):
+                    // - wasAlreadyAllocated=true + mapRegistryIndex != texture's -> the SAME
+                    //   texture's passes are executing under TWO contexts (double submission /
+                    //   shared pass objects across graphs) - an app-side bug.
+                    // - wasAlreadyAllocated=true + indices match -> a foreign/stale write into
+                    //   the texture's registry slot (aliasing).
+                    // - wasAlreadyAllocated=false -> the wait-event map lost a just-written
+                    //   entry (map lifecycle bug: prepareFrame/clear ordering).
+                    // registryGeneration vs the handle's generation shows whether the handle
+                    // predates a registry clear.
+                    let registryGeneration = texture.transientRegistryIndex >= 0 ? TransientTextureRegistry.instances[texture.transientRegistryIndex].generation : 255
                     print("[RenderGraph] materialiseTexture missing wait event: label=\(texture.label ?? "<no label>") flags=\(texture.flags) persistent=\(texture._usesPersistentRegistry)"
                         + " transientRegistryIndex=\(texture.transientRegistryIndex) resourceIndex=\(texture.index) generation=\(texture.generation)"
                         + " executingQueue=\(queueIndex)"
+                        + " wasAlreadyAllocated=\(hadBackingBeforeMaterialise)"
+                        + " mapRegistryIndex=\(resourceRegistry!.textureWaitEvents.transientRegistryIndex)"
+                        + " registryGeneration=\(registryGeneration)"
                         + " descriptor=\(texture.descriptor)")
                 }
                 precondition(texture.flags.contains(.windowHandle))
