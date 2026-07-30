@@ -113,34 +113,28 @@ enum PreFrameCommands {
                         + " registryGeneration=\(registryGeneration)"
                         + " descriptor=\(texture.descriptor)")
 
-                    // SELF-HEAL (2026-07-30, LiveSurface): the discriminator fired with
-                    // wasAlreadyAllocated=true, matching registry indices, and a current
-                    // generation - the texture's own graph found it pre-allocated, which
-                    // happens when an accumulation-restart storm abandons an in-flight
+                    // SELF-HEAL, revision 2 (2026-07-30, LiveSurface): the discriminator
+                    // fired with wasAlreadyAllocated=true, matching registry indices, and a
+                    // current generation - the texture's own graph found it pre-allocated,
+                    // which happens when an accumulation-restart storm abandons an in-flight
                     // execution after allocation but before frame cleanup (every observed
-                    // firing was tile 0 / sample 0 immediately after a restart). The trap
-                    // fires in release, so this was a shippable crash for a residue whose
-                    // correct treatment is simply a FRESH allocation: transients are
-                    // per-frame, the stale backing belongs to an execution that no longer
-                    // completes, and reallocating registers the wait event this frame
-                    // needs. The abandoned MTLTexture stays with its allocator until the
-                    // frame allocators reset (bounded, one frame's residue) - a small leak
-                    // in an already-abnormal path, traded against a crash. The print above
-                    // stays so occurrences remain visible while the abandonment ordering
-                    // gets a proper fix.
+                    // firing was tile 0 / sample 0 immediately after a restart). Revision 1
+                    // cleared the backing pointer and reallocated - and the abandoned
+                    // backing's pending command-end release then fired on disturbed
+                    // bookkeeping (swift_unknownObjectRelease in didCompleteCommand,
+                    // minutes after the first heal in the field). Revision 2 touches NO
+                    // ownership: the pre-set backing is a live texture and every observed
+                    // subject is a render TARGET that the frame fully overwrites, so REUSE
+                    // it and synthesize the one thing actually missing - a wait event -
+                    // conservatively, by waiting on everything submitted so far on every
+                    // queue. No allocator churn, no double bookkeeping; the original
+                    // residue's own release path proceeds exactly as it would have. The
+                    // print above stays so occurrences remain visible while the
+                    // abandonment ordering gets a proper fix.
                     if hadBackingBeforeMaterialise && !texture._usesPersistentRegistry && !texture.flags.contains(.historyBuffer) {
-                        texture.backingResourcePointer = nil
-                        do {
-                            _ = try await resourceRegistry!.allocateTextureIfNeeded(texture, forceGPUPrivate: !texture._usesPersistentRegistry, isStoredThisFrame: textureIsStored(texture))
-                        } catch {
-                            print("Error allocating texture: \(error)")
-                            throw error
-                        }
-                        if let healedWaitEvent = resourceRegistry!.textureWaitEvents[texture] {
-                            print("[RenderGraph] materialiseTexture: reallocated stale pre-allocated transient, continuing")
-                            waitEventValues[queueIndex] = max(healedWaitEvent.waitValue, waitEventValues[queueIndex])
-                            break
-                        }
+                        print("[RenderGraph] materialiseTexture: reusing stale pre-allocated transient with a conservative wait, continuing")
+                        waitEventValues = pointwiseMax(waitEventValues, QueueRegistry.lastSubmittedCommands)
+                        break
                     }
                 }
                 precondition(texture.flags.contains(.windowHandle))
