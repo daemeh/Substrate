@@ -68,6 +68,12 @@ final class TransientRegistryManager {
             assert(self.allocatedRegistries & (1 << index) != 0, "Registry index being disposed is not allocated.")
             self.allocatedRegistries &= ~(1 << index)
         }
+        // Q7 diagnostic (2026-07-29): freeing happens in RenderGraph.deinit with NO
+        // synchronisation against in-flight executions, so a freed index can be reissued
+        // while the old graph's submission is still executing - see the initialise() reuse
+        // note. Log the churn so a missing-wait-event trap can be correlated with a
+        // free -> reallocate cycle in the surrounding log lines.
+        print("[RenderGraph] transient registry index \(index) freed")
     }
 }
 
@@ -325,10 +331,25 @@ final class TransientRegistryManager {
     }
     
     func initialise(capacity: Int) {
+        // Q7 diagnostic (2026-07-29): this assert assumes a transient registry index is
+        // never reissued while its registry still holds state - but RenderGraph.deinit
+        // frees the index with no in-flight synchronisation, and in optimized builds the
+        // assert compiles out and this method silently RE-runs: count resets, storage is
+        // reallocated (old storage leaks; in-flight handles now alias fresh slots), and
+        // `generation` is NOT bumped, so the new graph's first textures collide handle-
+        // for-handle with the disposed graph's in-flight ones. Prime suspect for the
+        // missing-wait-event trap in PreFrameCommands (the disposed graph's execution
+        // writes a backing pointer into the recycled slot; the new graph's materialise
+        // then skips allocation and finds no wait event). Log the reuse so a trap can be
+        // correlated; behaviour is deliberately unchanged until the mechanism is
+        // confirmed from a full log.
+        if self.capacity != 0 {
+            print("[RenderGraph] transient registry index \(self.transientRegistryIndex) REINITIALISED while holding state (capacity \(self.capacity), generation \(self.generation)) - index recycled with a live registry")
+        }
         assert(self.capacity == 0)
-        
+
         self.capacity = capacity
-        
+
         self.count.initialize(to: Int.AtomicRepresentation(0))
         self.sharedPropertyStorage = .init(capacity: self.capacity, tracksUsages: Resource.tracksUsages)
         self.sharedStorage = .init(capacity: self.capacity)
