@@ -112,6 +112,36 @@ enum PreFrameCommands {
                         + " mapRegistryIndex=\(resourceRegistry!.textureWaitEvents.transientRegistryIndex)"
                         + " registryGeneration=\(registryGeneration)"
                         + " descriptor=\(texture.descriptor)")
+
+                    // SELF-HEAL (2026-07-30, LiveSurface): the discriminator fired with
+                    // wasAlreadyAllocated=true, matching registry indices, and a current
+                    // generation - the texture's own graph found it pre-allocated, which
+                    // happens when an accumulation-restart storm abandons an in-flight
+                    // execution after allocation but before frame cleanup (every observed
+                    // firing was tile 0 / sample 0 immediately after a restart). The trap
+                    // fires in release, so this was a shippable crash for a residue whose
+                    // correct treatment is simply a FRESH allocation: transients are
+                    // per-frame, the stale backing belongs to an execution that no longer
+                    // completes, and reallocating registers the wait event this frame
+                    // needs. The abandoned MTLTexture stays with its allocator until the
+                    // frame allocators reset (bounded, one frame's residue) - a small leak
+                    // in an already-abnormal path, traded against a crash. The print above
+                    // stays so occurrences remain visible while the abandonment ordering
+                    // gets a proper fix.
+                    if hadBackingBeforeMaterialise && !texture._usesPersistentRegistry && !texture.flags.contains(.historyBuffer) {
+                        texture.backingResourcePointer = nil
+                        do {
+                            _ = try await resourceRegistry!.allocateTextureIfNeeded(texture, forceGPUPrivate: !texture._usesPersistentRegistry, isStoredThisFrame: textureIsStored(texture))
+                        } catch {
+                            print("Error allocating texture: \(error)")
+                            throw error
+                        }
+                        if let healedWaitEvent = resourceRegistry!.textureWaitEvents[texture] {
+                            print("[RenderGraph] materialiseTexture: reallocated stale pre-allocated transient, continuing")
+                            waitEventValues[queueIndex] = max(healedWaitEvent.waitValue, waitEventValues[queueIndex])
+                            break
+                        }
+                    }
                 }
                 precondition(texture.flags.contains(.windowHandle))
             }
