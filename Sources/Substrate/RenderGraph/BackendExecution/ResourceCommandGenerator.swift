@@ -87,6 +87,15 @@ enum PreFrameCommands {
             if let textureWaitEvent = (texture.flags.contains(.historyBuffer) ? resourceRegistry!.historyBufferResourceWaitEvents[Resource(texture)] : resourceRegistry!.textureWaitEvents[texture]) {
                 waitEventValues[queueIndex] = max(textureWaitEvent.waitValue, waitEventValues[queueIndex])
             } else {
+                if !texture.flags.contains(.windowHandle) {
+                    // A transient texture with no wait event in THIS graph's registry was
+                    // allocated by a different (likely already-disposed) render graph - the
+                    // cross-graph resource-lifetime family. Identify it before the trap so a
+                    // crash in the field still names the culprit in the console log
+                    // (2026-07-29: hit once during live emboss-blur adjustment; the paused
+                    // debugger was lost before the texture could be inspected).
+                    print("[RenderGraph] materialiseTexture missing wait event: label=\(texture.label ?? "<no label>") flags=\(texture.flags) persistent=\(texture._usesPersistentRegistry) descriptor=\(texture.descriptor)")
+                }
                 precondition(texture.flags.contains(.windowHandle))
             }
             
