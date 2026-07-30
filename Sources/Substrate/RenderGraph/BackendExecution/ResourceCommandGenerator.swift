@@ -94,7 +94,10 @@ enum PreFrameCommands {
                     // crash in the field still names the culprit in the console log
                     // (2026-07-29: hit once during live emboss-blur adjustment; the paused
                     // debugger was lost before the texture could be inspected).
-                    print("[RenderGraph] materialiseTexture missing wait event: label=\(texture.label ?? "<no label>") flags=\(texture.flags) persistent=\(texture._usesPersistentRegistry) descriptor=\(texture.descriptor)")
+                    print("[RenderGraph] materialiseTexture missing wait event: label=\(texture.label ?? "<no label>") flags=\(texture.flags) persistent=\(texture._usesPersistentRegistry)"
+                        + " transientRegistryIndex=\(texture.transientRegistryIndex) resourceIndex=\(texture.index) generation=\(texture.generation)"
+                        + " executingQueue=\(queueIndex)"
+                        + " descriptor=\(texture.descriptor)")
                 }
                 precondition(texture.flags.contains(.windowHandle))
             }
