@@ -7,6 +7,7 @@
 
 #if canImport(Metal)
 
+import Foundation
 @preconcurrency import Metal
 import MetalKit
 import SubstrateUtilities
@@ -71,6 +72,20 @@ struct MTLTextureReference : MTLResourceReference {
 struct MTLTextureFrameRecord {
     var reference : MTLTextureReference
     var waitEvent : ContextWaitEvent
+}
+
+/// Q7 diagnostic scaffolding: the last backing-pointer write into each transient texture slot,
+/// keyed by raw slot index so it deliberately survives handle-generation changes - the opposite
+/// lifetime of the frame records above, which is what makes it forensic. The records make
+/// residue harmless; these stamps exist to identify the writer when residue appears: a stamp
+/// from an older epoch means an execution was abandoned between materialise and cleanup, while
+/// a stamp from the current epoch under a different generation means a concurrent (zombie)
+/// write landed after this epoch began - an execution escaping the serial stream. Remove once
+/// the abandonment ordering is found and fixed.
+struct TextureSlotWriteStamp {
+    var generation : UInt8 = 0
+    var site : UInt8 = 0 // 0 = never written, 1 = allocateTexture, 2 = allocateWindowHandleTexture, 3 = allocateTextureView
+    var epoch : UInt64 = 0
 }
 
 struct MTLTextureUsageProperties {
@@ -552,6 +567,13 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     
     var textureRecords : TransientResourceMap<Texture, MTLTextureFrameRecord>
     var bufferWaitEvents : TransientResourceMap<Buffer, ContextWaitEvent>
+
+    // Q7 diagnostic scaffolding (see TextureSlotWriteStamp). The epoch ticks once per execution
+    // in prepareFrame; stamps are plain-old-data and index < capacity is checked on access, so a
+    // racing zombie write can at worst tear a diagnostic value, never corrupt memory.
+    var executionEpoch : UInt64 = 0
+    private var slotWriteStamps : UnsafeMutablePointer<TextureSlotWriteStamp>? = nil
+    private var slotWriteStampCapacity = 0
     var argumentBufferWaitEvents : TransientResourceMap<ArgumentBuffer, ContextWaitEvent>
     var historyBufferResourceWaitEvents = [Resource : ContextWaitEvent]() // since history buffers use the persistent (rather than transient) resource maps.
     
@@ -624,15 +646,74 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     deinit {
         self.textureRecords.deinit()
         self.bufferWaitEvents.deinit()
+        self.slotWriteStamps?.deallocate()
         self.argumentBufferWaitEvents.deinit()
     }
     
     public func prepareFrame() {
         self.isExecutingFrame = true
-        
+
         self.textureRecords.prepareFrame()
         self.bufferWaitEvents.prepareFrame()
         self.argumentBufferWaitEvents.prepareFrame()
+
+        // Q7 diagnostic scaffolding: one epoch per execution.
+        self.executionEpoch += 1
+        let registryIndex = self.textureRecords.transientRegistryIndex
+        let registryCapacity = registryIndex >= 0 ? TransientTextureRegistry.instances[registryIndex].capacity : 0
+        if registryCapacity > self.slotWriteStampCapacity {
+            let newStamps = UnsafeMutablePointer<TextureSlotWriteStamp>.allocate(capacity: registryCapacity)
+            newStamps.initialize(repeating: TextureSlotWriteStamp(), count: registryCapacity)
+            if let oldStamps = self.slotWriteStamps {
+                newStamps.update(from: oldStamps, count: self.slotWriteStampCapacity)
+                oldStamps.deallocate()
+            }
+            self.slotWriteStamps = newStamps
+            self.slotWriteStampCapacity = registryCapacity
+        }
+    }
+
+    /// Q7 diagnostic scaffolding: record a transient backing-pointer write and flag anomalous
+    /// slot use at the moment it happens - by the time the residue canary in allocateTexture
+    /// sees a stale pointer, the writer's stack is long gone, so the backtrace must be captured
+    /// here. A write through a dead handle (handle generation != registry generation) is the
+    /// direct signature of an execution that escaped its serial stream; a second write to the
+    /// same slot in the same epoch under a different generation catches the same family from
+    /// the other side (the legitimate owner writing after the zombie).
+    private func stampBackingPointerWrite(_ texture: Texture, site: UInt8) {
+        let registryIndex = self.textureRecords.transientRegistryIndex
+        guard !texture._usesPersistentRegistry, registryIndex >= 0,
+              let stamps = self.slotWriteStamps, texture.index < self.slotWriteStampCapacity else { return }
+
+        let registryGeneration = TransientTextureRegistry.instances[registryIndex].generation
+        if texture.generation != registryGeneration {
+            print("[RenderGraph] ZOMBIE WRITE: transient texture backing pointer written through a dead handle"
+                + " (handle generation \(texture.generation), registry generation \(registryGeneration),"
+                + " slot \(texture.index), epoch \(self.executionEpoch), site \(site))."
+                + " An execution has escaped its serial stream. Backtrace:\n"
+                + Thread.callStackSymbols.joined(separator: "\n"))
+        } else {
+            let previous = stamps[texture.index]
+            if previous.site != 0, previous.epoch == self.executionEpoch, previous.generation != texture.generation {
+                print("[RenderGraph] SLOT COLLISION: transient texture slot \(texture.index) written twice in epoch \(self.executionEpoch)"
+                    + " by different handle generations (previous generation \(previous.generation) site \(previous.site),"
+                    + " now generation \(texture.generation) site \(site)). Backtrace:\n"
+                    + Thread.callStackSymbols.joined(separator: "\n"))
+            }
+        }
+
+        stamps[texture.index] = TextureSlotWriteStamp(generation: texture.generation, site: site, epoch: self.executionEpoch)
+    }
+
+    /// Q7 diagnostic scaffolding: describe the last write into a slot for the residue canaries.
+    func slotWriteStampDescription(for texture: Texture) -> String {
+        guard let stamps = self.slotWriteStamps, texture.index < self.slotWriteStampCapacity else { return "no write stamp" }
+        let stamp = stamps[texture.index]
+        if stamp.site == 0 { return "slot never stamped" }
+        let verdict = stamp.epoch == self.executionEpoch
+            ? "written DURING the current epoch - concurrent zombie write"
+            : "written \(self.executionEpoch - stamp.epoch) epoch(s) ago - execution abandoned before cleanup"
+        return "last write: generation \(stamp.generation), site \(stamp.site), epoch \(stamp.epoch) of \(self.executionEpoch) (\(verdict))"
     }
     
     public func registerWindowTexture(for texture: Texture, swapchain: Swapchain) {
@@ -782,9 +863,11 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
             // Abandonment canary (Q7): a fresh transient allocation found the slot cache already
             // populated - residue from an execution that stopped between materialise and cleanup.
             // Harmless now (the frame record, not this pointer, is the lifecycle authority, and
-            // the residue's own release path is keyed on its own record), but log it so the
-            // abandonment ordering bug stays visible until it gets a proper fix.
-            print("[RenderGraph] allocateTexture: transient \(texture.label ?? "<no label>") slot carried a stale backing pointer from an abandoned execution; reallocating cleanly")
+            // the residue's own release path is keyed on its own record), but log it with the
+            // slot's write stamp so the abandonment ordering bug can finally be attributed:
+            // the stamp says whether the stale pointer predates this epoch (abandoned execution)
+            // or was written during it (concurrent zombie write).
+            print("[RenderGraph] allocateTexture: transient \(texture.label ?? "<no label>") slot \(texture.index) carried a stale backing pointer; reallocating cleanly. \(self.slotWriteStampDescription(for: texture))")
         }
 
         let descriptor = MTLTextureDescriptor(texture.descriptor, usage: properties.usage, isAppleSiliconGPU: self.device.isAppleSiliconGPU)
@@ -802,6 +885,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
         }
 
         texture.backingResourcePointer = mtlTexture._texture.toOpaque()
+        self.stampBackingPointerWrite(texture, site: 1)
         if #available(macOS 13.0, iOS 16.0, tvOS 16.0, *) {
             texture[\.gpuAddresses] = mtlTexture.texture.gpuResourceID._impl
         }
@@ -846,6 +930,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
         
         let textureReference = MTLTextureReference(texture: Unmanaged.passRetained(mtlTexture))
         texture.backingResourcePointer = textureReference._texture.toOpaque()
+        self.stampBackingPointerWrite(texture, site: 3)
         if #available(macOS 13.0, iOS 16.0, tvOS 16.0, *) {
             texture[\.gpuAddresses] = mtlTexture.gpuResourceID._impl
         }
@@ -871,6 +956,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
                 if drawableTexture.width >= texture.descriptor.size.width && drawableTexture.height >= texture.descriptor.size.height {
                     self.frameDrawables.append((texture, .success(mtlDrawable)))
                     texture.backingResourcePointer = Unmanaged.passRetained(drawableTexture).toOpaque()
+                    self.stampBackingPointerWrite(texture, site: 2)
                     if #available(macOS 13.0, iOS 16.0, tvOS 16.0, *) {
                         texture[\.gpuAddresses] = drawableTexture.gpuResourceID._impl
                     }
@@ -1163,13 +1249,13 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
         self.textureRecords.removeAll(iterating: { texture, record, _ in
             guard let unmanagedTexture = record.reference._texture else { return } // pending window-drawable channel; drawables are released via frameDrawables
             if texture.isValid, !texture.flags.contains(.windowHandle), !texture.isTextureView {
-                print("[RenderGraph] cycleFrames: depositing undisposed transient texture \(texture.label ?? "<no label>") back to its allocator (abandoned-execution residue)")
+                print("[RenderGraph] cycleFrames: depositing undisposed transient texture \(texture.label ?? "<no label>") back to its allocator (abandoned-execution residue). \(self.slotWriteStampDescription(for: texture))")
                 let mtlTexture = record.reference.texture!
                 let allocator = self.allocatorForTexture(storageMode: mtlTexture.storageMode, flags: texture.flags, textureParams: (texture.descriptor.pixelFormat, mtlTexture.usage))
                 allocator.depositTexture(record.reference, fences: [], waitEvent: ContextWaitEvent(waitValue: self.queue.lastSubmittedCommand))
             } else {
                 _ = unmanagedTexture
-                print("[RenderGraph] cycleFrames: leaving undisposed transient texture record untouched (stale handle or window/view residue) - abandonment canary")
+                print("[RenderGraph] cycleFrames: leaving undisposed transient texture record untouched (stale handle or window/view residue) - abandonment canary. \(self.slotWriteStampDescription(for: texture))")
             }
         })
 
