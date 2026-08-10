@@ -77,67 +77,16 @@ enum PreFrameCommands {
             buffer.applyDeferredSliceActions()
             
         case .materialiseTexture(let texture):
-            // Diagnostic capture (2026-07-30): whether the backing pointer was set BEFORE this
-            // materialise decides between the candidate mechanisms below - allocateTextureIfNeeded
-            // early-returns on a pre-set pointer WITHOUT registering a wait event.
-            let hadBackingBeforeMaterialise = texture.backingResourcePointer != nil
             // If the resource hasn't already been allocated and is transient, we should force it to be GPU private since the CPU is guaranteed not to use it.
+            // The registry returns the wait event together with the texture reference, so a
+            // materialised texture cannot exist without its wait event (windowHandle textures,
+            // whose drawables are acquired later, report a zero wait).
             do {
-                _ = try await resourceRegistry!.allocateTextureIfNeeded(texture, forceGPUPrivate: !texture._usesPersistentRegistry, isStoredThisFrame: textureIsStored(texture))
+                let (_, textureWaitEvent) = try await resourceRegistry!.allocateTextureIfNeeded(texture, forceGPUPrivate: !texture._usesPersistentRegistry, isStoredThisFrame: textureIsStored(texture))
+                waitEventValues[queueIndex] = max(textureWaitEvent.waitValue, waitEventValues[queueIndex])
             } catch {
                 print("Error allocating texture: \(error)")
                 throw error
-            }
-            if let textureWaitEvent = (texture.flags.contains(.historyBuffer) ? resourceRegistry!.historyBufferResourceWaitEvents[Resource(texture)] : resourceRegistry!.textureWaitEvents[texture]) {
-                waitEventValues[queueIndex] = max(textureWaitEvent.waitValue, waitEventValues[queueIndex])
-            } else {
-                if !texture.flags.contains(.windowHandle) {
-                    // A transient texture with no wait event in THIS graph's registry. The
-                    // discriminating fields (2026-07-30, deterministic repro on emboss
-                    // adjustment in LiveSurface):
-                    // - wasAlreadyAllocated=true + mapRegistryIndex != texture's -> the SAME
-                    //   texture's passes are executing under TWO contexts (double submission /
-                    //   shared pass objects across graphs) - an app-side bug.
-                    // - wasAlreadyAllocated=true + indices match -> a foreign/stale write into
-                    //   the texture's registry slot (aliasing).
-                    // - wasAlreadyAllocated=false -> the wait-event map lost a just-written
-                    //   entry (map lifecycle bug: prepareFrame/clear ordering).
-                    // registryGeneration vs the handle's generation shows whether the handle
-                    // predates a registry clear.
-                    let registryGeneration = texture.transientRegistryIndex >= 0 ? TransientTextureRegistry.instances[texture.transientRegistryIndex].generation : 255
-                    print("[RenderGraph] materialiseTexture missing wait event: label=\(texture.label ?? "<no label>") flags=\(texture.flags) persistent=\(texture._usesPersistentRegistry)"
-                        + " transientRegistryIndex=\(texture.transientRegistryIndex) resourceIndex=\(texture.index) generation=\(texture.generation)"
-                        + " executingQueue=\(queueIndex)"
-                        + " wasAlreadyAllocated=\(hadBackingBeforeMaterialise)"
-                        + " mapRegistryIndex=\(resourceRegistry!.textureWaitEvents.transientRegistryIndex)"
-                        + " registryGeneration=\(registryGeneration)"
-                        + " descriptor=\(texture.descriptor)")
-
-                    // SELF-HEAL, revision 2 (2026-07-30, LiveSurface): the discriminator
-                    // fired with wasAlreadyAllocated=true, matching registry indices, and a
-                    // current generation - the texture's own graph found it pre-allocated,
-                    // which happens when an accumulation-restart storm abandons an in-flight
-                    // execution after allocation but before frame cleanup (every observed
-                    // firing was tile 0 / sample 0 immediately after a restart). Revision 1
-                    // cleared the backing pointer and reallocated - and the abandoned
-                    // backing's pending command-end release then fired on disturbed
-                    // bookkeeping (swift_unknownObjectRelease in didCompleteCommand,
-                    // minutes after the first heal in the field). Revision 2 touches NO
-                    // ownership: the pre-set backing is a live texture and every observed
-                    // subject is a render TARGET that the frame fully overwrites, so REUSE
-                    // it and synthesize the one thing actually missing - a wait event -
-                    // conservatively, by waiting on everything submitted so far on every
-                    // queue. No allocator churn, no double bookkeeping; the original
-                    // residue's own release path proceeds exactly as it would have. The
-                    // print above stays so occurrences remain visible while the
-                    // abandonment ordering gets a proper fix.
-                    if hadBackingBeforeMaterialise && !texture._usesPersistentRegistry && !texture.flags.contains(.historyBuffer) {
-                        print("[RenderGraph] materialiseTexture: reusing stale pre-allocated transient with a conservative wait, continuing")
-                        waitEventValues = pointwiseMax(waitEventValues, QueueRegistry.lastSubmittedCommands)
-                        break
-                    }
-                }
-                precondition(texture.flags.contains(.windowHandle))
             }
             
         case .materialiseTextureView(let texture):

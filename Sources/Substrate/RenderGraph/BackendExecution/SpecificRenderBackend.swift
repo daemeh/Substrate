@@ -105,7 +105,12 @@ protocol BackendTransientResourceRegistry: Sendable {
     func registerWindowTexture(for texture: Texture, swapchain: Swapchain) async
     
     func allocateBufferIfNeeded(_ buffer: Buffer, forceGPUPrivate: Bool) -> Backend.BufferReference
-    func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async throws -> Backend.TextureReference
+    /// Returns the backing reference together with the wait event that must be honoured before
+    /// the texture's memory may be touched this frame. Bundling the two means a caller can never
+    /// observe a materialised texture without its wait event; for transient textures both live in
+    /// a single frame-scoped record that dies with the execution, so no stale backing can survive
+    /// an abandoned frame and masquerade as a fresh allocation.
+    func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async throws -> (Backend.TextureReference, ContextWaitEvent)
     func allocateWindowHandleTexture(_ texture: Texture) async throws -> Backend.TextureReference
     func allocateTextureView(_ texture: Texture) -> Backend.TextureReference
 #if canImport(Metal)
@@ -119,7 +124,6 @@ protocol BackendTransientResourceRegistry: Sendable {
     
     func withHeapAliasingFencesIfPresent(for resourceHandle: Resource.Handle, perform: (inout [FenceDependency]) -> Void)
     
-    var textureWaitEvents: TransientResourceMap<Texture, ContextWaitEvent> { get }
     var bufferWaitEvents: TransientResourceMap<Buffer, ContextWaitEvent> { get }
     var argumentBufferWaitEvents: TransientResourceMap<ArgumentBuffer, ContextWaitEvent>? { get }
     var historyBufferResourceWaitEvents: [Resource : ContextWaitEvent] { get }

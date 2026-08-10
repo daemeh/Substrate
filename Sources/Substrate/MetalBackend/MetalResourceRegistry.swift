@@ -61,6 +61,18 @@ struct MTLTextureReference : MTLResourceReference {
     }
 }
 
+/// The per-frame lifecycle record for a transient texture: the backing reference and the wait
+/// event that gates its first use, bound together so neither can be observed without the other.
+/// Records live in a frame-scoped map that is emptied every frame (disposeTexture consumes them;
+/// cycleFrames sweeps stragglers), so they cannot leak across executions the way the registry
+/// slot's cached backing pointer can. The slot pointer remains as a read cache for encoding;
+/// lifecycle decisions (is this texture allocated this frame? what does disposal release?) must
+/// consult the record.
+struct MTLTextureFrameRecord {
+    var reference : MTLTextureReference
+    var waitEvent : ContextWaitEvent
+}
+
 struct MTLTextureUsageProperties {
     var usage : MTLTextureUsage
     var canBeMemoryless : Bool
@@ -538,7 +550,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     let persistentRegistry : MetalPersistentResourceRegistry
     let accessLock = SpinLock()
     
-    var textureWaitEvents : TransientResourceMap<Texture, ContextWaitEvent>
+    var textureRecords : TransientResourceMap<Texture, MTLTextureFrameRecord>
     var bufferWaitEvents : TransientResourceMap<Buffer, ContextWaitEvent>
     var argumentBufferWaitEvents : TransientResourceMap<ArgumentBuffer, ContextWaitEvent>
     var historyBufferResourceWaitEvents = [Resource : ContextWaitEvent]() // since history buffers use the persistent (rather than transient) resource maps.
@@ -576,7 +588,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
         self.queue = queue
         self.persistentRegistry = persistentRegistry
         
-        self.textureWaitEvents = .init(transientRegistryIndex: transientRegistryIndex)
+        self.textureRecords = .init(transientRegistryIndex: transientRegistryIndex)
         self.bufferWaitEvents = .init(transientRegistryIndex: transientRegistryIndex)
         self.argumentBufferWaitEvents = .init(transientRegistryIndex: transientRegistryIndex)
         
@@ -610,7 +622,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     }
     
     deinit {
-        self.textureWaitEvents.deinit()
+        self.textureRecords.deinit()
         self.bufferWaitEvents.deinit()
         self.argumentBufferWaitEvents.deinit()
     }
@@ -618,7 +630,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     public func prepareFrame() {
         self.isExecutingFrame = true
         
-        self.textureWaitEvents.prepareFrame()
+        self.textureRecords.prepareFrame()
         self.bufferWaitEvents.prepareFrame()
         self.argumentBufferWaitEvents.prepareFrame()
     }
@@ -745,9 +757,9 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     }
     
     @discardableResult
-    public func allocateTexture(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async throws -> MTLTextureReference {
+    public func allocateTexture(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async throws -> (MTLTextureReference, ContextWaitEvent) {
         let properties = self.computeTextureUsage(texture, isStoredThisFrame: isStoredThisFrame)
-        
+
         if texture.flags.contains(.windowHandle) {
             // Reserve a slot in texture references so we can later insert the texture reference in a thread-safe way, but don't actually allocate anything yet.
             // We can only do this if the texture is only used as a render target.
@@ -762,41 +774,51 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
                     throw error
                 }
             }
-            return texture.backingResourcePointer.map { MTLTextureReference(texture: .fromOpaque($0)) } ?? MTLTextureReference(windowTexture: ())
+            let reference = texture.backingResourcePointer.map { MTLTextureReference(texture: .fromOpaque($0)) } ?? MTLTextureReference(windowTexture: ())
+            return (reference, ContextWaitEvent())
         }
-        
+
+        if !texture._usesPersistentRegistry, texture.backingResourcePointer != nil {
+            // Abandonment canary (Q7): a fresh transient allocation found the slot cache already
+            // populated - residue from an execution that stopped between materialise and cleanup.
+            // Harmless now (the frame record, not this pointer, is the lifecycle authority, and
+            // the residue's own release path is keyed on its own record), but log it so the
+            // abandonment ordering bug stays visible until it gets a proper fix.
+            print("[RenderGraph] allocateTexture: transient \(texture.label ?? "<no label>") slot carried a stale backing pointer from an abandoned execution; reallocating cleanly")
+        }
+
         let descriptor = MTLTextureDescriptor(texture.descriptor, usage: properties.usage, isAppleSiliconGPU: self.device.isAppleSiliconGPU)
-        
+
         if properties.canBeMemoryless, #available(macOS 11.0, macCatalyst 14.0, *) {
             descriptor.storageMode = .memoryless
             descriptor.resourceOptions.formUnion(.storageModeMemoryless)
         }
-        
+
         let allocator = self.allocatorForTexture(storageMode: descriptor.storageMode, flags: texture.flags, textureParams: (texture.descriptor.pixelFormat, properties.usage))
         let (mtlTexture, fences, waitEvent) = allocator.collectTextureWithDescriptor(descriptor)
-        
+
         if let label = texture.label {
             mtlTexture.texture.label = label
         }
-        
+
         texture.backingResourcePointer = mtlTexture._texture.toOpaque()
         if #available(macOS 13.0, iOS 16.0, tvOS 16.0, *) {
             texture[\.gpuAddresses] = mtlTexture.texture.gpuResourceID._impl
         }
-        
+
         if texture._usesPersistentRegistry {
             precondition(texture.flags.contains(.historyBuffer))
             self.historyBufferResourceWaitEvents[Resource(texture)] = waitEvent
         } else {
-            self.textureWaitEvents[texture] = waitEvent
+            self.textureRecords[texture] = MTLTextureFrameRecord(reference: mtlTexture, waitEvent: waitEvent)
         }
-        
-        
+
+
         if !fences.isEmpty {
             self.heapResourceUsageFences[Resource(texture)] = fences
         }
-        
-        return mtlTexture
+
+        return (mtlTexture, waitEvent)
     }
     
     @discardableResult
@@ -827,6 +849,9 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
         if #available(macOS 13.0, iOS 16.0, tvOS 16.0, *) {
             texture[\.gpuAddresses] = mtlTexture.gpuResourceID._impl
         }
+        // Views synchronise through their base resource, so the record carries a zero wait event;
+        // it exists so disposal releases the view object captured here rather than re-reading the slot.
+        self.textureRecords[texture] = MTLTextureFrameRecord(reference: textureReference, waitEvent: ContextWaitEvent())
         return textureReference
     }
     
@@ -850,7 +875,7 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
                         texture[\.gpuAddresses] = drawableTexture.gpuResourceID._impl
                     }
                     
-                    if let waitEvent = self.textureWaitEvents[texture] {
+                    if let waitEvent = self.textureRecords[texture]?.waitEvent {
                         CommandEndActionManager.enqueue(action: .release(.fromOpaque(texture.backingResourcePointer!)), after: waitEvent.waitValue, on: self.queue)
                     }
                 } else {
@@ -920,9 +945,21 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     
     
     @discardableResult
-    public func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async throws -> MTLTextureReference {
-        if let mtlTexture = texture.backingResourcePointer {
-            return MTLTextureReference(texture: .fromOpaque(mtlTexture))
+    public func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) async throws -> (MTLTextureReference, ContextWaitEvent) {
+        if texture._usesPersistentRegistry {
+            // History buffers: the backing legitimately persists across frames in the persistent
+            // registry, so the slot pointer is the source of truth for them.
+            if let mtlTexture = texture.backingResourcePointer {
+                let waitEvent = self.historyBufferResourceWaitEvents[Resource(texture)]
+                assert(waitEvent != nil || texture.flags.contains(.windowHandle), "History buffer \(texture) has a backing texture but no wait event.")
+                return (MTLTextureReference(texture: .fromOpaque(mtlTexture)), waitEvent ?? ContextWaitEvent())
+            }
+        } else if let record = self.textureRecords[texture], record.reference._texture != nil {
+            // Transient: the frame-scoped record is the sole lifecycle authority. A stale slot
+            // pointer left behind by an abandoned execution can never satisfy this check - its
+            // record died with that execution (or is keyed under a dead handle), so the texture
+            // is simply reallocated below, wait event included.
+            return (record.reference, record.waitEvent)
         }
         return try await self.allocateTexture(texture, forceGPUPrivate: forceGPUPrivate, isStoredThisFrame: isStoredThisFrame)
     }
@@ -1013,27 +1050,53 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     
     func disposeTexture(_ texture: Texture, waitEvent: ContextWaitEvent) {
         // We keep the reference around until the end of the frame since allocation/disposal is all processed ahead of time.
-        
+
         if texture._usesPersistentRegistry {
+            // History buffers: the slot pointer is their source of truth (see allocateTextureIfNeeded).
             precondition(texture.flags.contains(.historyBuffer))
-            _ = Unmanaged<MTLTexture>.fromOpaque(texture.backingResourcePointer!).retain() // since the persistent registry releases its resources unconditionally on dispose, but we want the allocator to have ownership of it.
-        }
-        
-        if let mtlTexture = texture.backingResourcePointer {
-            if texture.flags.contains(.windowHandle) || texture.isTextureView {
-                CommandEndActionManager.enqueue(action: .release(.fromOpaque(mtlTexture)), after: waitEvent.waitValue, on: self.queue)
-                return
-            }
-            
+            let mtlTexture = texture.backingResourcePointer!
+            _ = Unmanaged<MTLTexture>.fromOpaque(mtlTexture).retain() // since the persistent registry releases its resources unconditionally on dispose, but we want the allocator to have ownership of it.
+
             var fences : [FenceDependency] = []
             if Self.isAliasedHeapResource(resource: Resource(texture)) {
                 fences = self.heapResourceDisposalFences[Resource(texture)] ?? []
             }
-            
+
             let allocator = self.allocatorForTexture(storageMode: texture.mtlTexture!.storageMode, flags: texture.flags, textureParams: (texture.descriptor.pixelFormat, texture.mtlTexture!.usage))
             allocator.depositTexture(MTLTextureReference(texture: .fromOpaque(mtlTexture)), fences: fences, waitEvent: waitEvent)
-        } else if texture.flags.contains(.windowHandle) {
-            self.textureWaitEvents[texture] = waitEvent
+            return
+        }
+
+        // Transient: dispose from the frame record captured at materialise time, never by
+        // re-reading the registry slot - releasing by record means a reallocation under the
+        // same handle can never disturb another allocation's release path.
+        if let record = self.textureRecords.removeValue(forKey: texture), let unmanagedTexture = record.reference._texture {
+            if texture.flags.contains(.windowHandle) || texture.isTextureView {
+                CommandEndActionManager.enqueue(action: .release(.fromOpaque(unmanagedTexture.toOpaque())), after: waitEvent.waitValue, on: self.queue)
+                return
+            }
+
+            var fences : [FenceDependency] = []
+            if Self.isAliasedHeapResource(resource: Resource(texture)) {
+                fences = self.heapResourceDisposalFences[Resource(texture)] ?? []
+            }
+
+            let mtlTexture = record.reference.texture!
+            let allocator = self.allocatorForTexture(storageMode: mtlTexture.storageMode, flags: texture.flags, textureParams: (texture.descriptor.pixelFormat, mtlTexture.usage))
+            allocator.depositTexture(record.reference, fences: fences, waitEvent: waitEvent)
+            return
+        }
+
+        if texture.flags.contains(.windowHandle) {
+            if let mtlTexture = texture.backingResourcePointer {
+                // The drawable was acquired eagerly (non-render-target usage) and so never got a
+                // frame record; release it once the frame's commands complete.
+                CommandEndActionManager.enqueue(action: .release(.fromOpaque(mtlTexture)), after: waitEvent.waitValue, on: self.queue)
+            } else {
+                // The drawable hasn't been acquired yet: park the wait event in the frame record
+                // so the late acquisition during encoding can schedule its release correctly.
+                self.textureRecords[texture] = MTLTextureFrameRecord(reference: MTLTextureReference(windowTexture: ()), waitEvent: waitEvent)
+            }
         }
     }
     
@@ -1090,7 +1153,26 @@ final class MetalTransientResourceRegistry: BackendTransientResourceRegistry, @u
     
     func cycleFrames() {
         // Clear all transient resources at the end of the frame.
-        
+
+        // Frame-record hygiene: every record should have been consumed by disposeTexture (or,
+        // for pending window drawables, superseded by the late acquisition). Anything left is
+        // residue from an execution that stopped between materialise and dispose - the
+        // abandonment family. Deposit what we can prove safe back to its allocator with a
+        // conservative wait; otherwise leave ownership untouched (a bounded leak, the same
+        // trade the old self-heal made) and log so the abandonment stays visible.
+        self.textureRecords.removeAll(iterating: { texture, record, _ in
+            guard let unmanagedTexture = record.reference._texture else { return } // pending window-drawable channel; drawables are released via frameDrawables
+            if texture.isValid, !texture.flags.contains(.windowHandle), !texture.isTextureView {
+                print("[RenderGraph] cycleFrames: depositing undisposed transient texture \(texture.label ?? "<no label>") back to its allocator (abandoned-execution residue)")
+                let mtlTexture = record.reference.texture!
+                let allocator = self.allocatorForTexture(storageMode: mtlTexture.storageMode, flags: texture.flags, textureParams: (texture.descriptor.pixelFormat, mtlTexture.usage))
+                allocator.depositTexture(record.reference, fences: [], waitEvent: ContextWaitEvent(waitValue: self.queue.lastSubmittedCommand))
+            } else {
+                _ = unmanagedTexture
+                print("[RenderGraph] cycleFrames: leaving undisposed transient texture record untouched (stale handle or window/view residue) - abandonment canary")
+            }
+        })
+
         self.heapResourceUsageFences.removeAll(keepingCapacity: true)
         self.heapResourceDisposalFences.removeAll(keepingCapacity: true)
         

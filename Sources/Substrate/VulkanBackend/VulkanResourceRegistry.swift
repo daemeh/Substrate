@@ -596,11 +596,18 @@ final class VulkanTransientResourceRegistry: BackendTransientResourceRegistry {
     }
     
     @discardableResult
-    public func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) -> VkImageReference {
+    public func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) -> (VkImageReference, ContextWaitEvent) {
         if let vkTexture = self.textureReferences[texture] {
-            return vkTexture
+            return (vkTexture, self.waitEventForMaterialisedTexture(texture))
         }
-        return self.allocateTexture(texture, forceGPUPrivate: forceGPUPrivate)
+        let reference = self.allocateTexture(texture, forceGPUPrivate: forceGPUPrivate)
+        return (reference, self.waitEventForMaterialisedTexture(texture))
+    }
+
+    private func waitEventForMaterialisedTexture(_ texture: Texture) -> ContextWaitEvent {
+        let waitEvent = texture.flags.contains(.historyBuffer) ? self.historyBufferResourceWaitEvents[Resource(texture)] : self.textureWaitEvents[texture]
+        assert(waitEvent != nil || texture.flags.contains(.windowHandle), "Texture \(texture) was materialised without a wait event.")
+        return waitEvent ?? ContextWaitEvent()
     }
     
     @discardableResult

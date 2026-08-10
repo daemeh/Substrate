@@ -159,7 +159,7 @@ final class UnavailableBackend : SpecificRenderBackend {
             preconditionFailure()
         }
         
-        func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) -> Backend.TextureReference {
+        func allocateTextureIfNeeded(_ texture: Texture, forceGPUPrivate: Bool, isStoredThisFrame: Bool) -> (Backend.TextureReference, ContextWaitEvent) {
             preconditionFailure()
         }
         
@@ -188,10 +188,6 @@ final class UnavailableBackend : SpecificRenderBackend {
         }
         
         func withHeapAliasingFencesIfPresent(for resourceHandle: Resource.Handle, perform: (inout [FenceDependency]) -> Void) {
-            preconditionFailure()
-        }
-        
-        var textureWaitEvents: TransientResourceMap<Texture, ContextWaitEvent> {
             preconditionFailure()
         }
         
